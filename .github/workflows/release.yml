@@ -77,7 +77,29 @@ jobs:
       - name: Build signed Universal app
         env:
           BUILD_NUMBER: ${{ github.run_number }}
-        run: ./scripts/build-app.sh
+        run: |
+          version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' App/Info.plist)"
+          app="build/Rotator.app"
+          archive="dist/Rotator-${version}-macOS-universal.zip"
+
+          swift build -c release --arch arm64 --disable-sandbox
+          swift build -c release --arch x86_64 --disable-sandbox
+
+          rm -rf "$app"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources" dist
+          lipo -create \
+            .build/arm64-apple-macosx/release/Rotator \
+            .build/x86_64-apple-macosx/release/Rotator \
+            -output "$app/Contents/MacOS/Rotator"
+          cp App/Info.plist "$app/Contents/Info.plist"
+          cp App/AppIcon.icns "$app/Contents/Resources/AppIcon.icns"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$app/Contents/Info.plist"
+
+          codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" "$app"
+          codesign --verify --deep --strict "$app"
+
+          rm -f "$archive"
+          ditto -c -k --sequesterRsrc --keepParent "$app" "$archive"
 
       - name: Verify signature and architectures
         run: |
@@ -92,7 +114,21 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: ./scripts/notarize.sh
+        run: |
+          version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' App/Info.plist)"
+          app="build/Rotator.app"
+          archive="dist/Rotator-${version}-macOS-universal.zip"
+
+          xcrun notarytool submit "$archive" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+          xcrun stapler staple "$app"
+          xcrun stapler validate "$app"
+
+          rm -f "$archive"
+          ditto -c -k --sequesterRsrc --keepParent "$app" "$archive"
 
       - name: Prepare release assets
         run: |
