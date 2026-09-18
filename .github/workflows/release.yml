@@ -1,0 +1,133 @@
+name: Draft Release
+
+on:
+  push:
+    branches:
+      - prod
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rotator-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-notarize-release:
+    runs-on: macos-15
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify required secrets
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          missing=0
+          for name in MACOS_CERTIFICATE_P12 MACOS_CERTIFICATE_PASSWORD APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::Missing GitHub Actions secret: $name"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Run tests
+        run: swift test --disable-sandbox
+
+      - name: Install Developer ID certificate
+        env:
+          CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          IDENTITY_OVERRIDE: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          keychain="$RUNNER_TEMP/rotator-signing.keychain-db"
+          keychain_password="$(openssl rand -base64 32)"
+          certificate="$RUNNER_TEMP/rotator-certificate.p12"
+          printf '%s' "$CERTIFICATE_P12" | tr -d ' \t\r\n' | base64 -d > "$certificate"
+
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" -k "$keychain" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain"
+          security list-keychains -d user -s "$keychain"
+
+          identity="$IDENTITY_OVERRIDE"
+          if [ -z "$identity" ]; then
+            identity="$(security find-identity -v -p codesigning "$keychain" | sed -n 's/.*"\(.*\)".*/\1/p' | head -1)"
+          fi
+          if [ -z "$identity" ]; then
+            echo "::error::Could not find a code-signing identity in MACOS_CERTIFICATE_P12"
+            exit 1
+          fi
+
+          echo "SIGNING_IDENTITY=$identity" >> "$GITHUB_ENV"
+          echo "ROTATOR_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+
+      - name: Build signed Universal app
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: ./scripts/build-app.sh
+
+      - name: Verify signature and architectures
+        run: |
+          codesign --verify --deep --strict --verbose=2 build/Rotator.app
+          codesign --display --verbose=4 build/Rotator.app
+          lipo -info build/Rotator.app/Contents/MacOS/Rotator | tee /tmp/rotator-architectures.txt
+          grep -q arm64 /tmp/rotator-architectures.txt
+          grep -q x86_64 /tmp/rotator-architectures.txt
+
+      - name: Notarize and staple
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: ./scripts/notarize.sh
+
+      - name: Prepare release assets
+        run: |
+          cd dist
+          shasum -a 256 Rotator-*-macOS-universal.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rotator-macos-universal
+          path: |
+            dist/Rotator-*-macOS-universal.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Create draft GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' App/Info.plist)"
+          tag="v${version}-build.${GITHUB_RUN_NUMBER}"
+          title="Rotator v${version} (build ${GITHUB_RUN_NUMBER})"
+          notes="Automated draft from prod at commit ${GITHUB_SHA}. Verify the notarized Universal build, edit these notes, and publish when ready."
+          gh release create "$tag" \
+            dist/Rotator-*-macOS-universal.zip \
+            dist/SHA256SUMS.txt \
+            --draft \
+            --target "$GITHUB_SHA" \
+            --title "$title" \
+            --notes "$notes"
+
+      - name: Remove temporary keychain
+        if: always()
+        run: |
+          if [ -n "${ROTATOR_KEYCHAIN:-}" ]; then
+            security delete-keychain "$ROTATOR_KEYCHAIN" || true
+          fi
