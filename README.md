@@ -54,6 +54,12 @@ NOTARY_PROFILE="rotator-notary" ./scripts/notarize.sh
 로컬 인증서와 공증 자격은 실제 배포 전에 다음 스크립트로 검증할 수 있습니다. 비밀값은 저장소 파일에 기록되지 않습니다.
 
 ```bash
+./scripts/setup-github-secrets.sh
+```
+
+위 스크립트는 각 값을 입력할 때마다 즉시 검증하고, 모든 검증을 통과한 경우에만 GitHub Secrets 등록 여부를 묻습니다. 개별 검증만 필요할 때는 다음 스크립트를 사용할 수 있습니다.
+
+```bash
 ./scripts/verify-signing-cert.sh /path/to/developer-id.p12
 ./scripts/verify-notary-credentials.sh
 ```
